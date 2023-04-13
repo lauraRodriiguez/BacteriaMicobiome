@@ -1,0 +1,590 @@
+library(phyloseq)
+library(decontam)
+#install.packages("remotes")
+#remotes::install_github("DanielSprockett/reltools")
+library(reltools)
+#install.packages("minpack.lm")
+library(minpack.lm)
+#Models for the whole community
+#install.packages("devtools")
+library(devtools)
+#install_github("DanielSprockett/tyRa")
+library(tyRa)
+#install.packages("Hmisc")
+library(Hmisc)
+library(Biostrings)
+library(ggplot2)
+library(dplyr)
+#install.packages("dplyr")
+library(tidyverse)
+library(vegan)
+library(ggpubr)
+#Biology using the codes we sacar the bilogy vamos a ver las diferencias del microbioma
+#el quiere un story
+cbbPalette <- c("#000000", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+
+
+## Load in data - skip if you already have the .RDS file below
+#Loading the mapping file
+samp_dat_bacteria <- read.csv("/Users/lau/Desktop/AU_research/Headland.peanutsoil/August.2021/Jan.2022/results_soilbacteria05.9.22/metadata_libr.prepall02.01.22.csv", na.strings = "NA")
+
+rownames(samp_dat_bacteria) <- samp_dat_bacteria$Sample #row names must match OTU table headers
+SAMP.bacteria <- phyloseq::sample_data(samp_dat_bacteria)
+
+# OTU table 
+otu_bacteria <- read.csv("/Users/lau/Desktop/AU_research/Headland.peanutsoil/August.2021/Jan.2022/results_soilbacteria05.9.22/OTU_table16s/newOTU/otu_table_16.csv")
+rownames(otu_bacteria) <- otu_bacteria$OTU
+otu_bacteria <- otu_bacteria[,-1]
+OTU.bacteria <- phyloseq::otu_table(otu_bacteria, taxa_are_rows = TRUE)
+
+colnames(otu_bacteria)
+
+# Taxonomy
+unite_taxonomy <-
+  read.csv("/Users/lau/Desktop/AU_research/Headland.peanutsoil/August.2021/Jan.2022/results_soilbacteria05.9.22/Taxonomy/16s_taxonomy.csv",
+           header = TRUE,
+           row.names = 1)
+
+head(unite_taxonomy)
+
+# Check for unclassified OTUs and remove them
+any(unite_taxonomy$Kingdom == "unidentified")
+nrow(unite_taxonomy[unite_taxonomy$Kingdom == "unidentified", ])
+unite_taxonomy[unite_taxonomy$Kingdom == "unidentified", ]
+
+unite_taxonomy %>% dplyr::filter(unite_taxonomy$Kingdom == "unidentified")
+unite_taxonomy <- subset(unite_taxonomy, Kingdom %in% "Bacteria")
+
+dim(unite_taxonomy)
+
+# Removing bacteria and other non-target taxa ----------------------------------------------------------------------------
+head(unite_taxonomy)
+levels(as.factor(unite_taxonomy$Kingdom))
+levels(as.factor(unite_taxonomy$Class))
+
+
+TAX.bacteria.unite <- phyloseq::tax_table(as.matrix(unite_taxonomy))
+
+# Fasta 
+FASTA.bacteria <- readDNAStringSet("//Users/lau/Desktop/AU_research/Headland.peanutsoil/August.2021/Jan.2022/results_soilbacteria05.9.22/fasta/otus.fasta", format="fasta", seek.first.rec=TRUE, use.names=TRUE)
+
+#could not fing SAMP.bacteria so I just errased it
+  #physeq_bacteria_nonfilt <- phyloseq::phyloseq(OTU.bacteria, TAX.bacteria.unite, FASTA.bacteria, SAMP.bacteria)
+
+physeq_bacteria_nonfilt <- phyloseq::phyloseq(OTU.bacteria, TAX.bacteria.unite, FASTA.bacteria, SAMP.bacteria)
+
+## DECONTAMINATE
+physeq_bacteria_nonfilt@sam_data$Sample_or_Control <- ifelse(physeq_bacteria_nonfilt@sam_data$Isolate.Code %in% c("NEC", "NCP"), "Control Sample", "True Sample")
+sample_data(physeq_bacteria_nonfilt)$is.neg <- sample_data(physeq_bacteria_nonfilt)$Sample_or_Control == "Control Sample"
+contamdf.prev <- isContaminant(physeq_bacteria_nonfilt, method="prevalence", neg="is.neg", threshold = 0.1, normalize = TRUE)
+badTaxa <- rownames(contamdf.prev[contamdf.prev$contaminant == TRUE,])
+
+print(badTaxa)
+
+ps.pa <- transform_sample_counts(physeq_bacteria_nonfilt, function(abund) 1*(abund>0))
+ps.pa.neg <- prune_samples(sample_data(ps.pa)$Sample_or_Control == "Control Sample", ps.pa)
+ps.pa.pos <- prune_samples(sample_data(ps.pa)$Sample_or_Control == "True Sample", ps.pa)
+# Make data.frame of prevalence in positive and negative samples
+df.pa <- data.frame(pa.pos=taxa_sums(ps.pa.pos), pa.neg=taxa_sums(ps.pa.neg),
+                    contaminant=contamdf.prev$contaminant)
+
+#chart name decontaminate(posible contaminants)
+ggplot(data=df.pa, aes(x=pa.neg, y=pa.pos, color=contaminant)) + geom_point() +
+  xlab("Prevalence (Negative Controls)") + ylab("Prevalence (True Samples)")
+
+goodTaxa <- setdiff(taxa_names(physeq_bacteria_nonfilt), badTaxa)
+bacteria_sub_no_bad <- prune_taxa(goodTaxa, physeq_bacteria_nonfilt)
+
+# analyse the postive controls Mock sequences
+
+
+
+
+# Sanity check - we only want OTUs that are bacteria
+unique(bacteria_sub_no_bad@tax_table@.Data[,1])# We only want Kingdom bacteria
+
+bacteria.obj1 <- bacteria_sub_no_bad %>% 
+  subset_taxa(Kingdom == "Bacteria") %>%
+  subset_samples(!Isolate.Code %in% c("NEC", "NCP", "PC")) %>%
+  phyloseq::filter_taxa(function(x) sum(x) > 0, TRUE) # remove taxa with zero reads (i.e., those not present in objective 1)
+
+unique(bacteria.obj1@tax_table@.Data[,1])# We only want Kingdom bacteria
+
+#read distribution. Read depth: number of sequences you get per sample.
+sort(data.frame(sample_sums(bacteria.obj1))[,1], decreasing = TRUE)
+
+# we are going to trash all the samples below 5,000. to make sure we take the best samples.
+
+## FILTER OUT SAMPLES BELOW 5000 reads
+
+bacteria.obj1_5000reads <- prune_samples(sample_sums(bacteria.obj1) > 5000, bacteria.obj1) %>%
+  phyloseq::filter_taxa(function(x) sum(x) > 0, TRUE) 
+
+sum(taxa_sums(bacteria.obj1_5000reads)) 
+#Final total for bacteria - 9,073,713 reads across *where did I got how many samples is using???????************ samples 
+
+mean(sample_sums(bacteria.obj1_5000reads)) # 31,181
+median(sample_sums(bacteria.obj1_5000reads)) # 31,517
+
+# Save an object to a file
+saveRDS(bacteria.obj1_5000reads, file = "Bacteria_peanut_soil_nonorm_071822.rds")
+# Restore the object. you can start from here!!
+bacteria.no.norm <- readRDS(file = "Bacteria_peanut_soil_nonorm_071822.rds")
+
+## Rarefaction analysis
+sam.data <- data.frame(bacteria.no.norm@sam_data)
+BOTU.table <- bacteria.no.norm@otu_table
+
+S <- specnumber(t(BOTU.table)) # observed number of species
+raremax <- min(rowSums(t(BOTU.table)))
+Srare <- rarefy(t(BOTU.table), raremax)
+#chart name rarefaction_1
+plot(S, Srare, xlab = "Observed No. of Species", ylab = "Rarefied No. of Species")
+abline(0, 1)
+rare.fun <- rarecurve(t(BOTU.table), step = 1000, sample = raremax, col = "blue", cex = 0.6)
+#rarefaction curve: rarefaction is a technique to assess species richness from the results of sampling. #
+#Rarefaction allows the calculation of species richness for a given number of individual samples, #
+#based on the construction of so-called rarefaction curves. This curve is a plot of the number of species #
+#as a function of the number of samples. Rarefaction curves generally grow rapidly at first, as the most common #
+#species are found, but the curves plateau as only the rarest species remain to be sampled.#
+bacteria.rare.curve.extract <- NULL
+for(i in 1:length(rare.fun)){
+  sample.200 <- data.frame(rare.spec = rare.fun[[i]])
+  sample.200$read_depth <- attr(rare.fun[[i]], "Subsample")
+  sample.200$Sample <- rownames(t(BOTU.table[,i]))
+  bacteria.rare.curve.extract <- rbind.data.frame(bacteria.rare.curve.extract, sample.200)
+}
+bacteria.rare.curve.extract2 <- left_join(sam.data, bacteria.rare.curve.extract, by = "Sample")
+
+bacteria.rare <- ggplot(bacteria.rare.curve.extract2, aes(x = read_depth, y = rare.spec, group = Sample)) + 
+  #geom_point() +
+  geom_line() + 
+  xlab("Reads") + 
+  ylab("Number of OTUs") + 
+  theme_classic() + 
+  geom_vline(xintercept = median(sample_sums(bacteria.obj1_5000reads)), linetype = "dashed") +
+  ggtitle("bacteria") 
+bacteria.rare
+
+# Normalize based on cumulative sum scaling
+MGS <- phyloseq_to_metagenomeSeq(bacteria.no.norm)
+p <- metagenomeSeq::cumNormStatFast(MGS)
+MGS <- metagenomeSeq::cumNorm(MGS, p =p)
+metagenomeSeq::normFactors(MGS) # exports the normalized factors for each sample
+norm.bacteria <- metagenomeSeq::MRcounts(MGS, norm = T)
+norm.bacteria.OTU <- phyloseq::otu_table(norm.bacteria, taxa_are_rows = TRUE)
+
+bacteria.css.norm <- phyloseq::phyloseq(norm.bacteria.OTU, TAX.bacteria.unite, FASTA.bacteria, SAMP.bacteria)
+
+## BACTERIA CSS NORM RDS
+#SAVE the bacteria phyloseq object as an RDS file to load faster in future.
+# Save an object to a file
+saveRDS(bacteria.css.norm, file = "Bacteria_peanut_soil_CSS_083121.rds")
+# Restore the object
+bacteria.css.norm <- readRDS(file = "Bacteria_peanut_soil_CSS_083121.rds")
+
+# Beta diversity 
+bacteria.dist.bray = phyloseq::distance(bacteria.css.norm, "bray") # create bray-curtis distance matrix
+bacteria.ord <- ordinate(bacteria.css.norm, "PCoA", "bray")
+global.nmds <- plot_ordination(bacteria.css.norm, ordination = bacteria.ord, type = "samples") 
+global.nmds.data <- global.nmds$data
+
+adonis2(bacteria.dist.bray~Soil*as.factor(week)*as.factor(Treatment), as(sample_data(bacteria.css.norm), "data.frame"), permutations = 9999) 
+#beta diversity plot
+ggplot() + 
+  geom_point(data = global.nmds.data, aes(x = Axis.1, y = Axis.2, shape = as.factor(Treatment), fill = as.factor(week)), alpha = 0.8, size = 2) +
+  theme_bw() +
+  ylab("PCoA2") + 
+  xlab("PCoA1") +
+  scale_fill_manual(values=cbbPalette) +
+  stat_ellipse(data = global.nmds.data, aes(x = Axis.1, y = Axis.2, group = Soil), type = "norm", linetype = 2) +
+  scale_shape_manual(values=c(21, 22, 23, 24, 25)) +
+  guides(fill=guide_legend(override.aes=list(shape=21))) 
+
+#subset for soil B (it says A but is B oops!)
+bacteria.css.norm.A <- bacteria.css.norm %>%
+  subset_samples(Soil == "B") %>%
+  phyloseq::filter_taxa(function(x) sum(x) > 0, TRUE) 
+
+bacteria.dist.bray = phyloseq::distance(bacteria.css.norm.A, "bray") # create bray-curtis distance matrix
+bacteria.ord <- ordinate(bacteria.css.norm.A, "PCoA", "bray")
+global.nmds <- plot_ordination(bacteria.css.norm.A, ordination = bacteria.ord, type = "samples") 
+global.nmds.data <- global.nmds$data
+
+adonis2(bacteria.dist.bray~as.factor(week)*as.factor(Treatment), as(sample_data(bacteria.css.norm.A), "data.frame"), permutations = 9999) 
+
+ggplot() + 
+  geom_point(data = global.nmds.data, aes(x = Axis.1, y = Axis.2, shape = as.factor(Treatment), fill = as.factor(week)), alpha = 0.8, size = 2) +
+  theme_bw() +
+  ylab("PCoA2") + 
+  xlab("PCoA1") +
+  scale_fill_manual(values=cbbPalette) +
+  #stat_ellipse(data = global.nmds.data, aes(x = Axis.1, y = Axis.2, group = Soil), type = "norm", linetype = 2) +
+  scale_shape_manual(values=c(21, 22, 23, 24, 25)) +
+  guides(fill=guide_legend(override.aes=list(shape=21))) 
+
+
+# Compositional bar charts
+#BiocManager::install("microbiome")
+library(microbiome)
+pseq <- microbiome::transform(bacteria.no.norm, "compositional")
+pseq <- microbiome::aggregate_rare(pseq, level = "Family", detection = 0.01, prevalence = 0.01)
+bar.chart <- microbiome::plot_composition(pseq,
+                                          taxonomic.level = "Family",
+                                          sample.sort = "week",
+                                          x.label = "Treatment") +
+  theme_classic()+
+  #scale_fill_manual(values= c(cbbPalette, "grey")) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = "Samples", y = "Relative abundance (%)",
+       title = "Relative abundance data") +
+  theme(axis.text.x = element_text(angle=90, hjust=1),
+        legend.text = element_text(face = "italic"))
+
+bar.chart$data
+
+plot_bar(bacteria.no.norm, fill="Phylum", x = "Treatment", facet_grid = "week")
+
+
+#Remove OTUs not greater than 10 reads
+
+keepTaxa = apply(X = as(otu_table(bacteria.no.norm), "matrix") > 10, MARGIN = 1, FUN = sum) >= 10
+bacteria.prop = prune_taxa(keepTaxa, bacteria.no.norm)
+
+library(data.table)
+# agglomerate taxa at Genus level
+glom <- tax_glom(bacteria.prop, taxrank = 'Order')
+# create dataframe from phyloseq object
+#transforme into the relative abundance
+GPr  = transform_sample_counts(glom, function(x) x / sum(x) )
+
+dat <- data.table(psmelt(GPr))
+# convert Phylum to a character vector from a factor 
+dat$Order <- as.character(dat$Order)
+
+################################
+#OTHER PART
+
+#is not running this part
+
+rel.abund.bacteria <- dat %>%
+  count(Phylum) 
+rel.abund.bacteria$Phylum_other <- rel.abund.bacteria$n < 10, "Other", rel.abund.bacteria$Phylum
+
+
+#################################
+
+
+rel.abund.bacteria <- dat %>%
+  group_by(Order) %>%
+  nest() %>%
+  mutate(mean.relabund = purrr::map(data,~mean(.$Abundance*100))) %>%
+  mutate(SE.relabund = purrr::map(data,~sd(.$Abundance*100)/sqrt(length(.$Abundance*100)))) %>%
+  unnest(mean.relabund, SE.relabund) %>%
+  unnest()
+
+rel.abund.bacteria <- as.data.frame(rel.abund.bacteria)
+rel.abund.bacteria$Order <- as.character(rel.abund.bacteria$Order)
+
+rel.abund.bacteria$Order <- ifelse(rel.abund.bacteria$mean.relabund <= 1, "Other", rel.abund.bacteria$Order)
+
+bacteria.colors <- c("#c6dbef","#9ecae1","#6baed6","#3182bd","#08519c",
+                  "#c7e9c0", "#a1d99b", "#74c476", "#41ab5d", "#238b45", "#005a32",
+                  "#fdd0a2", "#fdae6b", "#fd8d3c", "#f16913", "#d94801", "#8c2d04",
+                  "#dadaeb", "#bcbddc", "#9e9ac8", "#807dba", "#6a51a3", "#4a1486",
+                  "#fcbba1", "#fc9272", "#fb6a4a", "#ef3b2c", "#cb181d", "#99000d",
+                  "#d9d9d9", "#bdbdbd", "#969696", "#737373", "#525252", "#252525")
+
+#"red", "violet", "green", "blue", "navy", "black", "orange", "brown", "white", "pink", "grey", "golde", "salmon", "purple", "crimson", "teal", "silver", "ivory", "wheath")
+
+#cbbPalette <- c("#000000", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+
+ggplot(rel.abund.bacteria, aes(x = week, y = Abundance, fill = Order)) + 
+  facet_wrap(rel.abund.bacteria~Treatment~week(), nrow = 1, scales = "free_x", strip.position="bottom") +
+  geom_bar(stat = "identity", alpha = 0.9) +
+  theme_minimal() +
+  ylab("Relative Abundance (%)") +
+  xlab("") +
+  scale_fill_manual(values = sample(bacteria.colors)) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(fill = "Order") +
+  theme(axis.text.x = element_blank(),
+        legend.text = element_text(size = 10),
+        legend.key = element_blank(),
+        legend.title = element_text(size = 10),
+        legend.position = "right", 
+        strip.text.x = element_text(size = 10, vjust=2),
+        panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+
+#Peanut soil bacteria 07.18.22
+
+#here we did differential abundance analysis for bacteria we have a chart we want to do this for bacteria.
+#look up actinobacteriota bc it has been found in the dry and while increasing water it decreases in the wet treatments.
+
+# Differential abundance analysis 
+# Perform indicator species analysis just considering the original groups
+set.seed(12348)
+indicator.management <- indicspecies::multipatt(as.data.frame(t(bacteria.css.norm@otu_table)), cluster = bacteria.css.norm@sam_data$Treatment, max.order = 1)
+
+
+# summary of results
+summary(indicator.management, indvalcomp = TRUE)
+unite_taxonomy$OTU <- rownames(unite_taxonomy)
+unite_taxonomy[unite_taxonomy$OTU == "BOTU_1527",]
+# Explore some of these taxa, what are they? What might they do?
+
+indicator.treatment <- indicator.management$sign
+indicator.treatment2 <- indicator.treatment %>%
+  subset(p.value < 0.01) %>%
+  mutate(OTU = rownames(.))
+
+indicator.treatment3 <- left_join(indicator.treatment2, unite_taxonomy, by = "OTU") 
+indicator.treatment3$category <- ifelse(indicator.treatment3$index == 1, "Dry", 
+                                        ifelse(indicator.treatment3$index == 2, "Moderate",
+                                               ifelse(indicator.treatment3$index == 3, "Moderate",
+                                                      ifelse(indicator.treatment3$index == 4, "Wet",
+                                                             ifelse(indicator.treatment3$index == 5, "Wet", NA)))))
+
+  
+
+  indicator.treatment4 <- indicator.treatment3 %>% 
+    count(Phylum) 
+indicator.treatment4$Phylum_other <- ifelse(indicator.treatment4$n < 10, "Other", indicator.treatment4$Phylum)  
+
+indicator.treatment5 <- left_join(indicator.treatment3, indicator.treatment4, by = "Phylum")
+
+ggplot(indicator.treatment5, aes(x = category, fill = Phylum_other)) +
+  geom_bar(position = "stack") +
+  scale_fill_manual(values = c(cbbPalette, "purple", "brown", "grey")) +
+  theme_classic() +
+  xlab("")
+
+
+#11.13.22
+bacteria.no.norm@sam_data$Sample
+
+map <- bacteria.no.norm@sam_data %>%
+  as("data.frame")
+# Core - abundance occupancy modeling- SOYBEAN
+core.prioritizing <- function(phyloseq.object){
+  
+  set.seed(19)
+  rare.phyloseq.object <- rarefy_even_depth(phyloseq.object, replace=TRUE)
+  
+  nReads=sample_sums(rare.phyloseq.object)[[1]]                                                                 # input dataset needs to be rarified and the rarifaction depth included
+  otu <- rare.phyloseq.object@otu_table %>%
+    as("matrix")
+  map <- rare.phyloseq.object@sam_data %>%
+    as("data.frame")
+  
+  otu_PA <- 1*((otu>0)==1)                                               # presence-absence data
+  otu_occ <- rowSums(otu_PA)/ncol(otu_PA)                                # occupancy calculation
+  otu_rel <- apply(decostand(otu, method="total", MARGIN=2),1, mean)     # mean relative abundance
+  occ_abun <- add_rownames(as.data.frame(cbind(otu_occ, otu_rel)),'otu') # combining occupancy and abundance data frame
+  
+  # Ranking OTUs based on their occupancy
+  # For caluclating raking index we included following conditions:
+  #   - time-specific occupancy (sumF) = frequency of detection within time point (genotype or site)
+  #   - replication consistency (sumG) = has occupancy of 1 in at least one time point (genotype or site) (1 if occupancy 1, else 0)
+  
+  PresenceSum <- data.frame(otu = as.factor(row.names(otu)), otu) %>%
+    gather(Sample, abun, -otu) %>%
+    left_join(map, by = 'Sample') %>% #edit for sample id column in metadata
+    group_by(otu, week) %>% #edit for time point column in metadata
+    dplyr::summarise(time_freq=sum(abun>0)/length(abun),            # frequency of detection between time points
+                     coreTime=ifelse(time_freq == 1, 1, 0)) %>%     # 1 only if occupancy 1 with specific time, 0 if not
+    group_by(otu) %>%
+    dplyr::summarise(sumF=sum(time_freq),
+                     sumG=sum(coreTime),
+                     nS=length(week)*2,  #edit for time point column in metadata        
+                     Index=(sumF+sumG)/nS)                 # calculating weighting Index based on number of time points detected and
+  
+  otu_ranked <- occ_abun %>%
+    left_join(PresenceSum, by='otu') %>%
+    transmute(otu=otu,
+              rank=Index) %>%
+    arrange(desc(rank))
+  
+  # Calculating the contribution of ranked OTUs to the BC similarity
+  BCaddition <- NULL
+  
+  # calculating BC dissimilarity based on the 1st ranked OTU
+  # with 36 samples there should be 630 combinations n!/r!
+  otu_start=otu_ranked$otu[1]                  
+  start_matrix <- as.matrix(otu[otu_start,])
+  start_matrix <- t(start_matrix)
+  x <- apply(combn(ncol(start_matrix), 2), 2, function(x) sum(abs(start_matrix[,x[1]]- start_matrix[,x[2]]))/(2*nReads))
+  x_names <- apply(combn(ncol(start_matrix), 2), 2, function(x) paste(colnames(start_matrix)[x], collapse=' - '))
+  df_s <- data.frame(x_names,x)
+  df_s$rank_count <- 1
+  BCaddition <- rbind(BCaddition,df_s)
+  # calculating BC dissimilarity based on additon of ranked OTUs from 2nd to 500th. Can be set to the entire length of OTUs in the dataset, however it might take some time if more than 5000 OTUs are included.
+  for(i in 2:500){                              
+    otu_add=otu_ranked$otu[i]                      
+    add_matrix <- as.matrix(otu[otu_add,])
+    add_matrix <- t(add_matrix)
+    start_matrix <- rbind(start_matrix, add_matrix)
+    x <- apply(combn(ncol(start_matrix), 2), 2, function(x) sum(abs(start_matrix[,x[1]]-start_matrix[,x[2]]))/(2*nReads))
+    #x_names <- apply(combn(ncol(start_matrix), 2), 2, function(x) paste(colnames(start_matrix)[x], collapse=' - '))
+    df_a <- data.frame(x_names,x)
+    df_a$rank_count <- i 
+    BCaddition <- rbind.data.frame(BCaddition, df_a)
+  }
+  # calculating the BC dissimilarity of the whole dataset (not needed if the second loop is already including all OTUs)
+  x <-  apply(combn(ncol(otu), 2), 2, function(x) sum(abs(otu[,x[1]]-otu[,x[2]]))/(2*nReads))  
+  x_names <- apply(combn(ncol(otu), 2), 2, function(x) paste(colnames(otu)[x], collapse=' - '))
+  df_full <- data.frame(x_names,x)
+  df_full$rank_count <- length(rownames(otu))
+  BCfull <- rbind.data.frame(BCaddition, df_full)
+  
+  BC_ranked <- BCfull %>%
+    group_by(rank_count) %>%
+    dplyr::summarise(MeanBC=mean(x)) %>%            # mean Bray-Curtis dissimilarity
+    arrange(desc(-MeanBC)) %>%
+    mutate(proportionBC=MeanBC/max(MeanBC))   # proportion of the dissimilarity explained by the n number of ranked OTUs
+  Increase=BC_ranked$MeanBC[-1]/BC_ranked$MeanBC[-length(BC_ranked$MeanBC)]
+  increaseDF <- data.frame(IncreaseBC=c(0,(Increase)), rank=factor(c(1:(length(Increase)+1))))
+  increaseDF$rank <- as.numeric(increaseDF$rank)
+  BC_ranked <- left_join(BC_ranked, increaseDF, by = c("rank_count" = "rank"))
+  BC_ranked <- BC_ranked[-nrow(BC_ranked),]
+  
+  #Creating threshold for core inclusion - last call method
+  
+  #B) Final increase in BC similarity of equal or greater then 2%
+  lastCall <- last(as.numeric(BC_ranked$rank_count[(BC_ranked$IncreaseBC>=1.02)]))
+  
+  #Creating plot of Bray-Curtis similarity
+  plot <- ggplot(BC_ranked[1:100,], aes(x=factor(BC_ranked$rank_count[1:100], levels=BC_ranked$rank_count[1:100]))) +
+    geom_point(aes(y=proportionBC)) +
+    theme_classic() + theme(strip.background = element_blank(),axis.text.x = element_text(size=7, angle=45)) +
+    geom_vline(xintercept=last(as.numeric(BC_ranked$rank_count[(BC_ranked$IncreaseBC>=1.02)])), lty=3, col='black', cex=.5) +
+    labs(x='ranked OTUs',y='Bray-Curtis similarity') +
+    annotate(geom="text", x=last(as.numeric(BC_ranked$rank[(BC_ranked$IncreaseBC>=1.02)]))+3, y=.5, label=paste("Last 2% increase (",last(as.numeric(BC_ranked$rank[(BC_ranked$IncreaseBC>=1.02)])),")",sep=''), color="black")
+  
+  core.otus.CSS.mean.T1 <- otu_ranked$otu[1:lastCall]
+  return_list <- list(core.otus.CSS.mean.T1, plot, otu_ranked, occ_abun)
+  return(return_list)
+}
+#takes a long time
+#core.prioritizing(bacteria.no.norm)
+
+
+#CORN from dr.oel
+bacteria.core <- core.prioritizing(bacteria.no.norm)
+#install.packages("devtools")
+#library(devtools)
+##install_github("DanielSprockett/tyRa")
+saveRDS(bacteria.core, file = "bacteria.no.norm.core_check_point11.13.22.rds")
+# Restore the object
+bacteria.core <- readRDS(file = "bacteria.no.norm.core_check_point11.13.22.rds")
+
+bacteria.core[[1]]
+
+library(tyRa)
+set.seed(19)
+rare.phyloseq.object <- rarefy_even_depth(bacteria.no.norm, replace=TRUE)
+
+nReads=sample_sums(rare.phyloseq.object)[[1]]                                                                 # input dataset needs to be rarified and the rarifaction depth included 
+otu <- rare.phyloseq.object@otu_table %>%
+  as("matrix")
+taxa <- rownames(otu)
+map <- rare.phyloseq.object@sam_data %>%
+  as("data.frame")
+spp.out <- tyRa::fit_sncm(spp = t(otu), pool=NULL, taxon=taxa)
+
+predictions <- spp.out$predictions
+predictions$otu <- rownames(predictions)
+
+# Abundance-Occupancy
+taxonomy <- bacteria.no.norm@tax_table %>%
+  as("matrix") %>%
+  as_tibble() %>%
+  mutate(otu = rownames(bacteria.no.norm@tax_table))
+
+abund.occ3 <- left_join(taxonomy, predictions, by = "otu") 
+
+abund.occ3$core <- ifelse(abund.occ3$otu %in% bacteria.core[[1]], "Core", "Not Core")
+
+library(ggrepel)
+ggplot() +
+  geom_point(data = abund.occ3, aes(x = log10(p), y = freq, color = fit_class, shape = core), alpha = 0.8, size = 2) +
+  geom_line(color='black', data=abund.occ3, size=1, aes(y=abund.occ3$freq.pred, x=log10(abund.occ3$p)), alpha=.25) +
+  geom_line(color='black', lty='twodash', size=1, data=abund.occ3, aes(y=abund.occ3$pred.upr, x=log10(abund.occ3$p)), alpha=.25)+
+  geom_line(color='black', lty='twodash', size=1, data=abund.occ3, aes(y=abund.occ3$pred.lwr, x=log10(abund.occ3$p)), alpha=.25)+
+  labs(x="log10(Mean relative abundance)", y="Occupancy") + 
+  theme_classic() + 
+  scale_color_manual(values = c("#000000", "#E69F00", "#56B4E9")) +
+  geom_text_repel(data = abund.occ3[abund.occ3$core == "Core" & abund.occ3$fit_class == "Below prediction",], 
+                  aes(x = log10(p), y = freq, label = Label))
+
+
+
+
+#ANCOM-BC2 is analysis of composition sof microbiomes with bias correction
+
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+BiocManager::install("ANCOMBC")
+
+library(ANCOMBC)
+
+data(QMP)
+set.seed(12345)
+n = 150
+d = ncol(QMP)
+diff_prop = 0.1
+lfc_cont = -1
+lfc_cat2_vs_1 = -2
+lfc_cat3_vs_1 = 1
+
+# Generate the true abundances
+abn_data = sim_plnm(abn_table = QMP, taxa_are_rows = FALSE, prv_cut = 0.05, 
+                    n = n, lib_mean = 1e8, disp = 0.5)
+log_abn_data = log(abn_data + 1e-5)
+rownames(log_abn_data) = paste0("T", seq_len(d))
+colnames(log_abn_data) = paste0("S", seq_len(n))
+
+# Generate the sample and feature meta data
+# Sampling fractions are set to differ by batches
+smd = data.frame(samp_frac = log(c(runif(n/3, min = 1e-4, max = 1e-3),
+                                   runif(n/3, min = 1e-3, max = 1e-2),
+                                   runif(n/3, min = 1e-2, max = 1e-1))),
+                 cont_cov = rnorm(n),
+                 cat_cov = as.factor(rep(seq_len(3), each = n/3)))
+rownames(smd) = paste0("S", seq_len(n))
+
+fmd = data.frame(seq_eff = log(runif(d, min = 0.1, max = 1)),
+                 lfc_cont = sample(c(0, lfc_cont), 
+                                   size = d,
+                                   replace = TRUE,
+                                   prob = c(1 - diff_prop, diff_prop)),
+                 lfc_cat2_vs_1 = sample(c(0, lfc_cat2_vs_1), 
+                                        size = d,
+                                        replace = TRUE,
+                                        prob = c(1 - diff_prop, diff_prop)),
+                 lfc_cat3_vs_1 = sample(c(0, lfc_cat3_vs_1), 
+                                        size = d,
+                                        replace = TRUE,
+                                        prob = c(1 - diff_prop, diff_prop))) %>%
+  mutate(lfc_cat3_vs_2 = lfc_cat3_vs_1 - lfc_cat2_vs_1)
+rownames(fmd) = paste0("T", seq_len(d))
+
+# Add effect sizes of covariates to the true abundances
+dmy = caret::dummyVars(" ~ cat_cov", data = smd)
+smd_dmy = data.frame(predict(dmy, newdata = smd))
+
+log_abn_data = log_abn_data + outer(fmd$lfc_cont, smd$cont_cov)
+log_abn_data = log_abn_data + outer(fmd$lfc_cat2_vs_1, smd_dmy$cat_cov.2)
+log_abn_data = log_abn_data + outer(fmd$lfc_cat3_vs_1, smd_dmy$cat_cov.3)
+
+# Add sample- and taxon-specific biases
+log_otu_data = t(t(log_abn_data) + smd$samp_frac)
+log_otu_data = log_otu_data + fmd$seq_eff
+otu_data = round(exp(log_otu_data))
+
+# Create the tse object
+assays = S4Vectors::SimpleList(counts = otu_data)
+smd = S4Vectors::DataFrame(smd)
+tse = TreeSummarizedExperiment::TreeSummarizedExperiment(assays = assays, colData = smd)
+
+
